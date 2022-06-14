@@ -285,4 +285,9 @@ void play_one_round() {
             break;
         }
     }
+	
+	for (size_t row = 0; row < rows; row++) {
+		delete[] field[row];
+	}
+	delete[] field;
 }
