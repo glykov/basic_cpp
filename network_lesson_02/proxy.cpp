@@ -1,6 +1,11 @@
 #include <exception>
 #include <cassert>
+#include <cstring>
 #include "proxy.h"
+
+const std::regex ProxyServer::uri_regexp(R"_((?:([^\:]*)\://)?(?:([^\:\@]*)(?:\:([^\@]*))?\@)?(?:([^/\:]*)\.(?=[^\./\:]*\.[^\./\:]*))?([^\./\:]*)(?:\.([^/\.\:]*))?(?:\:([0-9]*))?(/[^\?#]*(?=.*?/)/)?([^\?#]*)?(?:\?([^#]*))?(?:#(.*))?)_",
+                                         std::regex_constants::ECMAScript | std::regex_constants::icase);
+
 
 ProxyServer::ProxyServer(unsigned short port) : port_(port), sock_(AF_INET, SOCK_STREAM, 0)
 {
@@ -87,16 +92,209 @@ std::string ProxyServer::read_line(Socket& socket) const
     return result;
 }
 
+void ProxyServer::client_error(Socket &sock, const std::string &cause, int err_num, const std::string &short_message,
+                               const std::string &long_message) const
+{
+    std::string err_headers = "HTTP/1.0 " + std::to_string(err_num) + " " + short_message + "\r\n";
+    std::stringstream err_body_s;
+    err_body_s
+            << "<html><title>Proxy Error</title>"
+            << "<body bgcolor=0xffffff>\r\n"
+            << err_num <<  ": " << short_message << "\r\n"
+            << "<p>" << long_message << ": " << cause << "\r\n"
+            << "<hr><em>The GB Student Proxy Server</em>\r\n"
+            << "</body></html>\r\n";
+
+    // Print the HTTP response.
+    send(sock, &err_headers.at(0), err_headers.size(), 0);
+
+    err_headers = "Content-type: text/html\r\n";
+    send(sock, &err_headers.at(0), err_headers.size(), 0);
+
+    auto err_body = err_body_s.str();
+
+    err_headers = "Content-length: " + std::to_string(err_body.size()) + "\r\n\r\n";
+    send(sock, &err_headers.at(0), err_headers.size(), 0);
+    send(sock, &err_body.at(0), err_body.size(), 0);
+}
+
+
+ProxyServer::uri_data ProxyServer::parse_uri(const std::string &uri) const
+{
+    std::smatch uri_match;
+    if (!std::regex_match(uri, uri_match, uri_regexp)) return std::make_tuple("", "./", 0);
+
+    std::string host_name = uri_match[5];
+    std::stringstream host_name_s;
+
+    if (uri_match[4].matched) host_name_s << uri_match[4] << ".";
+    host_name_s << uri_match[5];
+    if (uri_match[6].matched) host_name_s << "." << uri_match[6];
+
+    std::string path = uri_match[9].str();
+    host_name = host_name_s.str();
+
+    return std::make_tuple(host_name,
+                           path.size() ? path : "/",
+                           uri_match[7].matched ? std::stoi(uri_match[7]) : default_target_port);
+}
+
+
+std::tuple<std::string, std::string> ProxyServer::parse_request_headers(Socket &s) const
+{
+    std::string line;
+    std::stringstream result;
+    std::string host_name;
+
+    static const std::string host_header_name = "Host: ";
+
+    do
+    {
+        line = read_line(s);
+
+        if (("\r\n" == line) || ("\n" == line))
+            continue;
+
+        if (line.find("User-Agent:") != std::string::npos)
+            continue;
+
+        if (line.find("Accept:") != std::string::npos)
+            continue;
+
+        if (line.find("Accept-Encoding:") != std::string::npos)
+            continue;
+
+        if (line.find("Connection:") != std::string::npos)
+            continue;
+
+        if (line.find("Proxy-Connection:") != std::string::npos)
+            continue;
+
+        auto host_pos = line.find(host_header_name);
+        if (host_pos != std::string::npos)
+        {
+            host_name = line.substr(host_pos + host_header_name.length());
+            continue;
+        }
+
+        result << line;
+    } while ((line != "\r\n") && (line != "\n"));
+
+    return make_tuple(result.str(), host_name);
+}
+
+
 void ProxyServer::proxify(Socket& client_socket)
 {
     std::string method;
     std::string uri;
     std::string version;
 
-    std::cout << "Waiting for client to connect..." << std::endl;
+    std::cout << "Waiting for client request..." << std::endl;
 
-    try {
-        std::string line = read_line(client_socket);
+    try
+    {
+        auto line = read_line(client_socket);
+
+        std::stringstream ss(line);
+        ss >> method >> uri >> version;
+
+        std::cout
+                << "Client request: \"" << line << "\" parsed.\n"
+                << "Method = " << method << "\n"
+                << "URI = " << uri << "\n"
+                << "Version = " << version
+                << std::endl;
+
+        // This proxy currently only supports the GET call.
+        if (method != "GET")
+        {
+            std::cerr << "Unknown method: \"" << method << "\"" << std::endl;
+            client_error(client_socket, method, 501, "Not implemented", "This proxy does not implement this method");
+            return;
+        }
+
+        // Parse the HTTP request to extract the hostname, path and port.
+        auto [host_name, path, port] = parse_uri(uri);
+
+        std::cout
+                << "Host name from the request = " << host_name << "\n"
+                << "Path = " << path << "\n"
+                << "Port from the request = " << port
+                << std::endl;
+
+        auto [new_headers, host_name_from_header] = parse_request_headers(client_socket);
+
+        if (host_name_from_header.size())
+        {
+            std::tie(host_name, std::ignore, port) = parse_uri(host_name_from_header);
+            std::cout
+                    << "Host from the header = " << host_name << "\n"
+                    << "Port from the header = " << port
+                    << std::endl;
+        }
+
+        // write client request to file
+        std::ofstream fout("log.txt", std::ios::app);
+        fout << line;
+        // ======================================================
+
+        // Create new connection with server.
+        auto&& proxy_to_server_socket = connect_to_target_server(host_name, port);
+
+        std::cout
+                << "Connected.\n\n"
+                << "Writing HTTP request to the target server..."
+                << std::endl;
+
+        if (send(proxy_to_server_socket, &line.at(0), line.size(), 0) < 0)
+        {
+            auto s = "client error";
+            std::cerr << s << std::endl;
+            client_error(client_socket, method, 503, "Internal error", s);
+            return;
+        }
+
+        std::cout
+                << "Request was written.\n\n"
+                << "Reading response from the target server..."
+                << std::endl;
+
+        std::string response;
+
+        do
+        {
+            // HTTP 1.x is a text protocol.
+            line = read_line(proxy_to_server_socket);
+            response += line;
+        } while (line.size());
+
+        // write server response to file
+        fout << response;
+        //=================================================
+
+        std::cout
+                << "Response was read.\n"
+                << "=======================\n"
+                << "Target server response:\n"
+                << "-----------------------\n"
+                << response
+                << "\n=======================\n"
+                << std::endl;
+
+        std::cout
+                << "Forwarding response to the client..."
+                << std::endl;
+
+        send(client_socket, &response.at(0), response.size(), 0);
+    }
+    catch(const std::exception &e)
+    {
+        std::cerr << e.what() << std::endl;
+    }
+    catch(...)
+    {
+        std::cerr << "Unknown exception in the client thread!" << std::endl;
     }
 }
 
